@@ -8,4 +8,4 @@ install: *.cpp
 	$(CXX) *.cpp $(CXXFLAGS) $(INCLUDES) -o c_server $(LFLAGS) $(LIBS)
 
 clean:
-	rm c_server+
+	rm c_server
