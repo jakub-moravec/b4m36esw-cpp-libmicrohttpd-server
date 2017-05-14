@@ -1,45 +1,19 @@
 #include <sys/types.h>
-
-#ifndef _WIN32
-
-#include <sys/select.h>
 #include <sys/socket.h>
-#else
-#include <winsock2.h>
-#endif
-
-#include<iostream>
-#include<boost/tokenizer.hpp>
-#include <boost/foreach.hpp>
-#include <boost/algorithm/string.hpp>
-#include <boost/tokenizer.hpp>
+#include <iostream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <set>
 #include <string.h>
 #include <microhttpd.h>
-#include <string>
 #include <zlib.h>
-#include <vector>
-
-#ifdef _MSC_VER
-#ifndef strcasecmp
-#define strcasecmp(a,b) _stricmp((a),(b))
-#endif /* !strcasecmp */
-#endif /* _MSC_VER */
-
-#if defined(_MSC_VER) && _MSC_VER + 0 <= 1800
-/* Substitution is OK while return value is not used */
-#define snprintf _snprintf
-#endif
 
 #define PORT            7777
 #define POSTBUFFERSIZE  1000000
 
 using namespace std;
-using namespace boost;
 
-char * response = (char *) "OK";
+char * response = (char *) "OK\r\n";
 
 enum ConnectionType {
     GET = 0,
@@ -55,16 +29,16 @@ struct connection_info_struct {
 set<string> words;
 
 static int
-send_page(struct MHD_Connection *connection, const char *page, int status_code) {
+respond(struct MHD_Connection *connection, const char *message, int status_code) {
     int ret;
     struct MHD_Response *response;
 
-    response = MHD_create_response_from_buffer(strlen(page), (void *) page, MHD_RESPMEM_MUST_COPY);
+    response = MHD_create_response_from_buffer(strlen(message), (void *) message, MHD_RESPMEM_MUST_COPY);
     if (!response) {
         return MHD_NO;
     }
     MHD_add_response_header(response, MHD_HTTP_HEADER_CONTENT_TYPE, "text/html");
-    ret = MHD_queue_response(connection, status_code, response);
+    ret = MHD_queue_response(connection, (unsigned int) status_code, response);
     MHD_destroy_response(response);
     return ret;
 }
@@ -74,30 +48,30 @@ add_words(void *coninfo_cls) {
     struct connection_info_struct *con_info = (connection_info_struct *) coninfo_cls;
 
     // unzip
-    char * uncompressed = (char*)calloc(POSTBUFFERSIZE, sizeof(char));
+    uint newlen = (uint) (4 * con_info->zipindex);
+    char * uncompressed = (char*) malloc(newlen * sizeof(char));
     z_stream infstream;
     infstream.zalloc = Z_NULL;
     infstream.zfree = Z_NULL;
     infstream.opaque = Z_NULL;
     // setup "b" as the input and "c" as the compressed output
-    infstream.avail_in = (uInt) (size_t) con_info->zipindex; // size of input
+    infstream.avail_in = (uInt) con_info->zipindex; // size of input
     infstream.next_in = (Bytef *) con_info->zipcontent; // input char array
-    infstream.avail_out = (uInt) POSTBUFFERSIZE * sizeof(char); // size of output
-    infstream.next_out = (Bytef *)uncompressed; // output char array
+    infstream.avail_out = newlen * sizeof(char); // size of output
+    infstream.next_out = (Bytef *) uncompressed; // output char array
     inflateInit2(&infstream,16+MAX_WBITS);
     inflate(&infstream, Z_NO_FLUSH);
     inflateEnd(&infstream);
 
     //tokenize
-    string separator = "\\s+|\\t+|\\n+|\\r+| ";
+    char *separator = (char *) " \t\r\n";
     char *p = strtok(uncompressed, separator);
+    int i = 0;
     while (p) {
-        string word = p;
-        trim(word);
-        if(!word.empty()) {
-            words.insert(p);
-        }
+        std::string word(p);
+        words.insert(word);
         p = strtok(NULL, separator);
+        i++;
     }
 }
 
@@ -105,21 +79,20 @@ static void
 request_completed(void *cls, struct MHD_Connection *connection, void **con_cls, enum MHD_RequestTerminationCode toe) {
     struct connection_info_struct *con_info = (connection_info_struct *) *con_cls;
 
+    *con_cls = NULL;
+
     if (NULL == con_info) {
         return;
     }
 
     if (con_info->connectiontype == POST) {
-        if (con_info->zipcontent) {
+        if (con_info->zipcontent != NULL) {
             free(con_info->zipcontent);
-            con_info->zipcontent;
+            con_info->zipcontent = NULL;
         }
     }
-
     free(con_info);
-    *con_cls = NULL;
 }
-
 
 static int
 answer_to_connection(void *cls, struct MHD_Connection *connection, const char *url, const char *method, const char *version,
@@ -134,6 +107,7 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
 
         if (0 == strcasecmp(method, MHD_HTTP_METHOD_POST)) {
             con_info->zipcontent = (char *) calloc(POSTBUFFERSIZE, sizeof(char));
+            con_info->zipindex = 0;
             con_info->connectiontype = POST;
         } else {
             con_info->connectiontype = GET;
@@ -145,10 +119,13 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
     }
 
     if (0 == strcasecmp(method, MHD_HTTP_METHOD_GET)) {
-        char buffer[1024];
         long word_size = words.size();
-        snprintf(buffer, sizeof(buffer), "%ld", word_size);
-        return send_page(connection, buffer, MHD_HTTP_OK);
+        words.clear();
+
+        int len = snprintf(NULL, 0, "%ld\r\n", word_size);
+        char *response = (char *) malloc((len + 1) * sizeof(char));
+        snprintf(response, (size_t) (len + 1), "%ld\r\n", word_size);
+        return respond(connection, response, 200);
     }
 
     if (0 == strcasecmp(method, MHD_HTTP_METHOD_POST)) {
@@ -167,11 +144,11 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
             add_words(con_info);
 
             // send response
-            return send_page(connection, response, MHD_HTTP_ACCEPTED);
+            return respond(connection, response, 200);
         }
     }
 
-    return send_page(connection, response, MHD_HTTP_BAD_REQUEST);
+    return respond(connection, "NOK\r\n", 400);
 }
 
 int
