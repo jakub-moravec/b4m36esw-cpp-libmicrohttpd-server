@@ -11,8 +11,12 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <set>
 #include <string.h>
 #include <microhttpd.h>
+#include <string>
+#include <zlib.h>
+#include <vector>
 
 #ifdef _MSC_VER
 #ifndef strcasecmp
@@ -26,47 +30,25 @@
 #endif
 
 #define PORT            8888
-#define POSTBUFFERSIZE  512
-#define MAXCLIENTS      2
+#define POSTBUFFERSIZE  1000000
+
+using namespace std;
 
 enum ConnectionType {
     GET = 0,
     POST = 1
 };
 
-static unsigned int nr_of_uploading_clients = 0;
-
 struct connection_info_struct {
     enum ConnectionType connectiontype;
     struct MHD_PostProcessor *postprocessor;
-    FILE *fp;
+    char * zipcontent;
+    int zipindex;
     const char *answerstring;
     int answercode;
 };
 
-const char *askpage = "<html><body>\n\
-                       Upload a file, please!<br>\n\
-                       There are %u clients uploading at the moment.<br>\n\
-                       <form action=\"/filepost\" method=\"post\" enctype=\"multipart/form-data\">\n\
-                       <input name=\"file\" type=\"file\">\n\
-                       <input type=\"submit\" value=\" Send \"></form>\n\
-                       </body></html>";
-
-const char *busypage =
-        "<html><body>This server is busy, please try again later.</body></html>";
-
-const char *completepage =
-        "<html><body>The upload has been completed.</body></html>";
-
-const char *errorpage =
-        "<html><body>This doesn't seem to be right.</body></html>";
-const char *servererrorpage =
-        "<html><body>An internal server error has occured.</body></html>";
-const char *fileexistspage =
-        "<html><body>This file already exists.</body></html>";
-const char *const postprocerror =
-        "<html><head><title>Error</title></head><body>Error processing POST data</body></html>";
-
+set<string> words;
 
 static int
 send_page(struct MHD_Connection *connection, const char *page, int status_code) {
@@ -74,51 +56,57 @@ send_page(struct MHD_Connection *connection, const char *page, int status_code) 
     struct MHD_Response *response;
 
     response = MHD_create_response_from_buffer(strlen(page), (void *) page, MHD_RESPMEM_MUST_COPY);
-    if (!response)
+    if (!response) {
         return MHD_NO;
+    }
     MHD_add_response_header(response, MHD_HTTP_HEADER_CONTENT_TYPE, "text/html");
     ret = MHD_queue_response(connection, status_code, response);
     MHD_destroy_response(response);
-
     return ret;
 }
 
+static void
+add_words(void *coninfo_cls) {
+    struct connection_info_struct *con_info = (connection_info_struct *) coninfo_cls;
+
+    // unzip
+    char * unzippedContent = (char *) calloc(POSTBUFFERSIZE, sizeof(char));
+    gzFile infile = (gzFile)gzopen(con_info->zipcontent, "rb");
+    gzrewind(infile);
+    gzread(infile, unzippedContent, sizeof(unzippedContent));
+    gzclose(infile);
+
+    //tokenize
+    char *p;
+    p = strtok(unzippedContent, "\\s+");
+
+    if(p)
+    {
+        printf("%s\n", p);
+    }
+    p = strtok(NULL, "\\s+");
+
+    if(p)
+        printf("%s\n", p);
+
+    // add words
+    words.insert(p);
+}
 
 static int
 iterate_post(void *coninfo_cls, enum MHD_ValueKind kind, const char *key, const char *filename, const char *content_type,
              const char *transfer_encoding, const char *data, uint64_t off, size_t size) {
-    struct connection_info_struct *con_info = (connection_info_struct *) coninfo_cls;
-    FILE *fp;
 
-    con_info->answerstring = servererrorpage;
+    struct connection_info_struct *con_info = (connection_info_struct *) coninfo_cls;
+
     con_info->answercode = MHD_HTTP_INTERNAL_SERVER_ERROR;
 
-    if (0 != strcmp(key, "file")) {
-        return MHD_NO;
+    for (int i = 0; i < size; ++i) {
+        con_info->zipcontent[con_info->zipindex] = data[i];
+        con_info->zipindex ++;
     }
 
-    if (!con_info->fp) {
-        if (NULL != (fp = fopen(filename, "rb"))) {
-            fclose(fp);
-            con_info->answerstring = fileexistspage;
-            con_info->answercode = MHD_HTTP_FORBIDDEN;
-            return MHD_NO;
-        }
-
-        con_info->fp = fopen(filename, "ab");
-        if (!con_info->fp) {
-            return MHD_NO;
-        }
-    }
-
-    if (size > 0) {
-        if (!fwrite(data, sizeof(char), size, con_info->fp)) {
-            return MHD_NO;
-        }
-    }
-
-    con_info->answerstring = completepage;
-    con_info->answercode = MHD_HTTP_OK;
+    con_info->answercode = MHD_HTTP_ACCEPTED;
 
     return MHD_YES;
 }
@@ -135,11 +123,11 @@ request_completed(void *cls, struct MHD_Connection *connection, void **con_cls, 
     if (con_info->connectiontype == POST) {
         if (NULL != con_info->postprocessor) {
             MHD_destroy_post_processor(con_info->postprocessor);
-            nr_of_uploading_clients--;
         }
 
-        if (con_info->fp) {
-            fclose(con_info->fp);
+        if (con_info->zipcontent) {
+            free(con_info->zipcontent);
+            con_info->zipcontent;
         }
     }
 
@@ -154,30 +142,22 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
     if (NULL == *con_cls) {
         struct connection_info_struct *con_info;
 
-        if (nr_of_uploading_clients >= MAXCLIENTS) {
-            return send_page(connection, busypage, MHD_HTTP_SERVICE_UNAVAILABLE);
-        }
-
         con_info = (connection_info_struct *) malloc(sizeof(struct connection_info_struct));
-        if (NULL == con_info) {
+        if (con_info == NULL) {
             return MHD_NO;
         }
 
-        con_info->fp = NULL;
-
         if (0 == strcasecmp(method, MHD_HTTP_METHOD_POST)) {
+            con_info->zipcontent = (char *) calloc(POSTBUFFERSIZE, sizeof(char));
             con_info->postprocessor = MHD_create_post_processor(connection, POSTBUFFERSIZE, &iterate_post, (void *) con_info);
 
-            if (NULL == con_info->postprocessor) {
+            if (con_info->postprocessor == NULL) {
                 free(con_info);
                 return MHD_NO;
             }
 
-            nr_of_uploading_clients++;
-
             con_info->connectiontype = POST;
-            con_info->answercode = MHD_HTTP_OK;
-            con_info->answerstring = completepage;
+            con_info->answercode = MHD_HTTP_ACCEPTED;
         } else {
             con_info->connectiontype = GET;
         }
@@ -190,32 +170,39 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
     if (0 == strcasecmp(method, MHD_HTTP_METHOD_GET)) {
         char buffer[1024];
 
-        snprintf(buffer, sizeof(buffer), askpage, nr_of_uploading_clients);
+        // todo lock
+        long word_size = words.size();
+        // todo unlock
+
+        snprintf(buffer, sizeof(buffer), "%ld", word_size);
         return send_page(connection, buffer, MHD_HTTP_OK);
     }
+
+    char * tmp = (char *) 'a';
 
     if (0 == strcasecmp(method, MHD_HTTP_METHOD_POST)) {
         struct connection_info_struct *con_info = (connection_info_struct *) *con_cls;
 
+
+
         if (0 != *upload_data_size) {
             if (MHD_post_process(con_info->postprocessor, upload_data, *upload_data_size) != MHD_YES) {
-                return send_page(connection, postprocerror, MHD_HTTP_BAD_REQUEST);
+                return send_page(connection, tmp, MHD_HTTP_BAD_REQUEST);
             }
             *upload_data_size = 0;
 
             return MHD_YES;
         } else {
-            if (NULL != con_info->fp) {
-                fclose(con_info->fp);
-                con_info->fp = NULL;
-            }
-            /* Now it is safe to open and inspect the file before
-                   calling send_page with a response */
-            return send_page(connection, con_info->answerstring, con_info->answercode);
+            // zip content is complete
+            // count words
+            add_words(con_info);
+
+            // send response
+            return send_page(connection, tmp, MHD_HTTP_ACCEPTED);
         }
     }
 
-    return send_page(connection, errorpage, MHD_HTTP_BAD_REQUEST);
+    return send_page(connection, tmp, MHD_HTTP_BAD_REQUEST);
 }
 
 int
