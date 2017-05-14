@@ -4,11 +4,14 @@
 
 #include <sys/select.h>
 #include <sys/socket.h>
-
 #else
 #include <winsock2.h>
 #endif
 
+#include<iostream>
+#include<boost/tokenizer.hpp>
+#include <boost/foreach.hpp>
+#include <boost/tokenizer.hpp>
 #include <stdio.h>
 #include <stdlib.h>
 #include <set>
@@ -33,6 +36,9 @@
 #define POSTBUFFERSIZE  1000000
 
 using namespace std;
+using namespace boost;
+
+char * response = (char *) "OK";
 
 enum ConnectionType {
     GET = 0,
@@ -70,47 +76,26 @@ add_words(void *coninfo_cls) {
     struct connection_info_struct *con_info = (connection_info_struct *) coninfo_cls;
 
     // unzip
-    char * unzippedContent = (char *) calloc(POSTBUFFERSIZE, sizeof(char));
-    gzFile infile = (gzFile)gzopen(con_info->zipcontent, "rb");
-    gzrewind(infile);
-    gzread(infile, unzippedContent, sizeof(unzippedContent));
-    gzclose(infile);
+//    char* unzipped = (char *) calloc(POSTBUFFERSIZE, sizeof(char));
+//    ulong destLen = strlen(con_info->zipcontent);
+//    int des = uncompress((Bytef *) unzipped, &destLen, (const Bytef *) con_info->zipcontent, destLen);
 
     //tokenize
-    char *p;
-    p = strtok(unzippedContent, "\\s+");
+//    char *p;
+//    p = strtok(con_info->zipcontent, "\\s+");
+//
+//    char_separator<char> sep("\\s+");
+//    tokenizer< char_separator<char> > tokens(con_info->zipcontent, sep);
+//    BOOST_FOREACH (const string& t, tokens) {
+//        cout << t << "." << endl;
+//    }
 
-    if(p)
-    {
-        printf("%s\n", p);
+    char *p = strtok(con_info->zipcontent, "\\s+");
+    while (p) {
+        words.insert(p);
+        p = strtok(NULL, " ");
     }
-    p = strtok(NULL, "\\s+");
-
-    if(p)
-        printf("%s\n", p);
-
-    // add words
-    words.insert(p);
 }
-
-static int
-iterate_post(void *coninfo_cls, enum MHD_ValueKind kind, const char *key, const char *filename, const char *content_type,
-             const char *transfer_encoding, const char *data, uint64_t off, size_t size) {
-
-    struct connection_info_struct *con_info = (connection_info_struct *) coninfo_cls;
-
-    con_info->answercode = MHD_HTTP_INTERNAL_SERVER_ERROR;
-
-    for (int i = 0; i < size; ++i) {
-        con_info->zipcontent[con_info->zipindex] = data[i];
-        con_info->zipindex ++;
-    }
-
-    con_info->answercode = MHD_HTTP_ACCEPTED;
-
-    return MHD_YES;
-}
-
 
 static void
 request_completed(void *cls, struct MHD_Connection *connection, void **con_cls, enum MHD_RequestTerminationCode toe) {
@@ -149,12 +134,15 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
 
         if (0 == strcasecmp(method, MHD_HTTP_METHOD_POST)) {
             con_info->zipcontent = (char *) calloc(POSTBUFFERSIZE, sizeof(char));
-            con_info->postprocessor = MHD_create_post_processor(connection, POSTBUFFERSIZE, &iterate_post, (void *) con_info);
 
-            if (con_info->postprocessor == NULL) {
-                free(con_info);
-                return MHD_NO;
-            }
+
+
+//            con_info->postprocessor = MHD_create_post_processor(connection, POSTBUFFERSIZE, &iterate_post, (void *) con_info);
+//
+//            if (con_info->postprocessor == NULL) {
+//                free(con_info);
+//                return MHD_NO;
+//            }
 
             con_info->connectiontype = POST;
             con_info->answercode = MHD_HTTP_ACCEPTED;
@@ -178,7 +166,7 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
         return send_page(connection, buffer, MHD_HTTP_OK);
     }
 
-    char * tmp = (char *) 'a';
+
 
     if (0 == strcasecmp(method, MHD_HTTP_METHOD_POST)) {
         struct connection_info_struct *con_info = (connection_info_struct *) *con_cls;
@@ -186,9 +174,11 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
 
 
         if (0 != *upload_data_size) {
-            if (MHD_post_process(con_info->postprocessor, upload_data, *upload_data_size) != MHD_YES) {
-                return send_page(connection, tmp, MHD_HTTP_BAD_REQUEST);
+            for (size_t i = 0; i < *upload_data_size; ++i) {
+                con_info->zipcontent[con_info->zipindex] = upload_data[i];
+                con_info->zipindex ++;
             }
+
             *upload_data_size = 0;
 
             return MHD_YES;
@@ -198,11 +188,11 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
             add_words(con_info);
 
             // send response
-            return send_page(connection, tmp, MHD_HTTP_ACCEPTED);
+            return send_page(connection, response, MHD_HTTP_ACCEPTED);
         }
     }
 
-    return send_page(connection, tmp, MHD_HTTP_BAD_REQUEST);
+    return send_page(connection, response, MHD_HTTP_BAD_REQUEST);
 }
 
 int
