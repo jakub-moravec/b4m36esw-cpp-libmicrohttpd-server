@@ -7,13 +7,13 @@
 #include <string.h>
 #include <microhttpd.h>
 #include <zlib.h>
+#include <unordered_set>
 
 #define PORT            7777
 #define POSTBUFFERSIZE  1000000
 
-using namespace std;
-
 char * response = (char *) "OK\r\n";
+char * bad_response = (char *) "NOK\r\n";
 
 enum ConnectionType {
     GET = 0,
@@ -26,10 +26,13 @@ struct connection_info_struct {
     int zipindex;
 };
 
-set<string> words;
+/**
+ * Holder for all the unique worlds accepted by post requests.
+ */
+std::unordered_set<std::string> * words;
+pthread_rwlock_t *lock;
 
-static int
-respond(struct MHD_Connection *connection, const char *message, int status_code) {
+static int respond(struct MHD_Connection *connection, const char *message, int status_code) {
     int ret;
     struct MHD_Response *response;
 
@@ -43,43 +46,52 @@ respond(struct MHD_Connection *connection, const char *message, int status_code)
     return ret;
 }
 
-static void
-add_words(void *coninfo_cls) {
+/**
+ * Uncompresses the post content and adds new unique words to set.
+ * @param coninfo_cls
+ */
+static void add_words(void *coninfo_cls) {
     struct connection_info_struct *con_info = (connection_info_struct *) coninfo_cls;
 
     // unzip
     uint newlen = (uint) (4 * con_info->zipindex);
-    char * uncompressed = (char*) malloc(newlen * sizeof(char));
+    char * uncompressed = (char*) calloc(newlen, sizeof(char));
     z_stream infstream;
     infstream.zalloc = Z_NULL;
     infstream.zfree = Z_NULL;
     infstream.opaque = Z_NULL;
-    // setup "b" as the input and "c" as the compressed output
     infstream.avail_in = (uInt) con_info->zipindex; // size of input
     infstream.next_in = (Bytef *) con_info->zipcontent; // input char array
     infstream.avail_out = newlen * sizeof(char); // size of output
     infstream.next_out = (Bytef *) uncompressed; // output char array
-    inflateInit2(&infstream,16+MAX_WBITS);
+    inflateInit2(&infstream,32+MAX_WBITS);
     inflate(&infstream, Z_NO_FLUSH);
     inflateEnd(&infstream);
 
     //tokenize
-    char *separator = (char *) " \t\r\n";
-    char *p = strtok(uncompressed, separator);
-    int i = 0;
+    char * saveptr;
+    char * p = strtok_r(uncompressed, " \t\r\n", &saveptr);
     while (p) {
         std::string word(p);
-        words.insert(word);
-        p = strtok(NULL, separator);
-        i++;
+        if(words->find(word) == words->end()) { // there is no need to create a reed lock - because of the set implementation
+            pthread_rwlock_wrlock(lock);
+            // add word
+            words->insert(word);
+            pthread_rwlock_unlock(lock);
+        }
+        p = strtok_r(NULL, " \t\r\n", &saveptr);
     }
 }
 
-static void
-request_completed(void *cls, struct MHD_Connection *connection, void **con_cls, enum MHD_RequestTerminationCode toe) {
+/**
+ * Called after the whole request is handeld. Used just to clean after self.
+ * @param cls
+ * @param connection
+ * @param con_cls
+ * @param toe
+ */
+static void request_completed(void *cls, struct MHD_Connection *connection, void **con_cls, enum MHD_RequestTerminationCode toe) {
     struct connection_info_struct *con_info = (connection_info_struct *) *con_cls;
-
-    *con_cls = NULL;
 
     if (NULL == con_info) {
         return;
@@ -92,11 +104,27 @@ request_completed(void *cls, struct MHD_Connection *connection, void **con_cls, 
         }
     }
     free(con_info);
+    *con_cls = NULL;
 }
 
-static int
-answer_to_connection(void *cls, struct MHD_Connection *connection, const char *url, const char *method, const char *version,
+/**
+ * Handle method for
+ * @param cls
+ * @param connection
+ * @param url
+ * @param method
+ * @param version
+ * @param upload_data
+ * @param upload_data_size
+ * @param con_cls
+ * @return
+ */
+static int answer_to_connection(void *cls, struct MHD_Connection *connection, const char *url, const char *method, const char *version,
                      const char *upload_data, size_t *upload_data_size, void **con_cls) {
+
+    /**
+     * First request fragment, read header, leave the rest for next time.
+     */
     if (NULL == *con_cls) {
         struct connection_info_struct *con_info;
 
@@ -118,9 +146,12 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
         return MHD_YES;
     }
 
+    /**
+     * Handle get.
+     */
     if (0 == strcasecmp(method, MHD_HTTP_METHOD_GET)) {
-        long word_size = words.size();
-        words.clear();
+        long word_size = words->size();
+        words->clear();
 
         int len = snprintf(NULL, 0, "%ld\r\n", word_size);
         char *response = (char *) malloc((len + 1) * sizeof(char));
@@ -128,6 +159,9 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
         return respond(connection, response, 200);
     }
 
+    /**
+     * Handle post.
+     */
     if (0 == strcasecmp(method, MHD_HTTP_METHOD_POST)) {
         struct connection_info_struct *con_info = (connection_info_struct *) *con_cls;
 
@@ -139,7 +173,9 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
             *upload_data_size = 0;
             return MHD_YES;
         } else {
-            // zip content is complete
+            /**
+             * Handle complete request.
+             */
             // count words
             add_words(con_info);
 
@@ -147,15 +183,22 @@ answer_to_connection(void *cls, struct MHD_Connection *connection, const char *u
             return respond(connection, response, 200);
         }
     }
-
-    return respond(connection, "NOK\r\n", 400);
+    // situation, that should not occur
+    return respond(connection, bad_response, 400);
 }
 
-int
-main() {
+/**
+ * Main class just creates the service - deamon and starts it.
+ * Deamon creates thread for every connection - which is much slower than thread pool, but also much easier to set up :)
+ * @return
+ */
+int main() {
     struct MHD_Daemon *daemon;
 
-    daemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, PORT, NULL, NULL, &answer_to_connection, NULL,
+    words = new std::unordered_set<std::string> ();
+    lock = new pthread_rwlock_t();
+
+    daemon = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, PORT, NULL, NULL, &answer_to_connection, NULL,
                               MHD_OPTION_NOTIFY_COMPLETED, &request_completed, NULL, MHD_OPTION_END);
     if (NULL == daemon) {
         return 1;
